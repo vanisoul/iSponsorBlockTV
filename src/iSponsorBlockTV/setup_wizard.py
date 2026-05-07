@@ -47,9 +47,11 @@ def _validate_pairing_code(pairing_code: str) -> bool:
     except ValueError:
         return False  # not a number
 
+
 def escape(text: str) -> Content:
     """Content ignores markup"""
     return Content(text)
+
 
 class ModalWithClickExit(Screen):
     """A modal screen that exits when clicked outside its bounds.
