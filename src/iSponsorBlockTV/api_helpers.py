@@ -1,9 +1,10 @@
 import html
+import logging
 from hashlib import sha256
 from asyncio import FIRST_COMPLETED, Task, create_task, wait
 from typing import AsyncIterator, Collection, TypeVar
 
-from aiohttp import ClientSession
+from aiohttp import ClientSession, ClientTimeout
 from cache import AsyncLRU
 from pyytlounge.wrapper import api_base
 
@@ -61,6 +62,17 @@ class ApiHelper:
         self.web_session = web_session
         self.num_devices = len(config.devices)
         self.minimum_skip_length = config.minimum_skip_length
+        self.segment_provider = getattr(config, "segment_provider", "sponsorblock")
+        self.external_segment_url = getattr(
+            config, "external_segment_url", "http://localhost:8787/segments"
+        )
+        self.external_segment_timeout_seconds = getattr(
+            config, "external_segment_timeout_seconds", 20
+        )
+        self.external_min_confidence = getattr(config, "external_min_confidence", 0.85)
+        self.external_fallback_to_sponsorblock = getattr(
+            config, "external_fallback_to_sponsorblock", True
+        )
 
     @staticmethod
     def _normalize_pairing_code(pairing_code):
@@ -183,6 +195,12 @@ class ApiHelper:
                 True,
             )  # Return empty list and True to indicate
             # that the cache should last forever
+        if self.segment_provider == "external":
+            segments, ignore_ttl, _used_fallback = await self.get_external_segments(vid_id)
+            return segments, ignore_ttl
+        return await self.get_sponsorblock_segments(vid_id)
+
+    async def get_sponsorblock_segments(self, vid_id):
         vid_id_hashed = sha256(vid_id.encode("utf-8")).hexdigest()[
             :4
         ]  # Hashes video id and gets the first 4 characters
@@ -207,6 +225,131 @@ class ApiHelper:
                 response_json = i
                 break
         return self.process_segments(response_json, self.minimum_skip_length)
+
+    async def get_external_segments(self, vid_id):
+        """Fetch segments from the external provider.
+
+        Returns (segments, ignore_ttl, used_fallback). When used_fallback is True the
+        first two values are the SponsorBlock fallback result and should be returned
+        directly; otherwise they are the external result.
+        """
+        logger = logging.getLogger(__name__)
+        timeout = ClientTimeout(total=self.external_segment_timeout_seconds)
+        try:
+            async with self.web_session.get(
+                self.external_segment_url,
+                params={"video_id": vid_id},
+                timeout=timeout,
+                headers={"Accept": "application/json"},
+            ) as response:
+                if response.status != 200:
+                    logger.warning(
+                        "External segment provider returned status %s for %s",
+                        response.status,
+                        vid_id,
+                    )
+                    return await self._external_fallback(vid_id)
+                try:
+                    payload = await response.json(content_type=None)
+                except Exception as exc:
+                    logger.warning(
+                        "External segment provider returned invalid JSON for %s: %s",
+                        vid_id,
+                        exc,
+                    )
+                    return await self._external_fallback(vid_id)
+        except Exception as exc:
+            logger.warning("External segment provider request failed for %s: %s", vid_id, exc)
+            return await self._external_fallback(vid_id)
+
+        if not isinstance(payload, dict) or not isinstance(payload.get("segments"), list):
+            logger.warning("External segment provider returned unexpected schema for %s", vid_id)
+            return await self._external_fallback(vid_id)
+
+        if "status" in payload and payload["status"] != "ok":
+            logger.warning(
+                "External segment provider reported status %r for %s",
+                payload.get("status"),
+                vid_id,
+            )
+            return await self._external_fallback(vid_id)
+
+        if "video_id" in payload and payload["video_id"] != vid_id:
+            logger.warning(
+                "External segment provider returned mismatched video_id %r for %s",
+                payload.get("video_id"),
+                vid_id,
+            )
+            return await self._external_fallback(vid_id)
+
+        source = payload.get("source", "external")
+        segments = self._normalize_external_segments(payload["segments"], source)
+        if not segments and self.external_fallback_to_sponsorblock:
+            fallback_segments, fallback_ignore_ttl = await self.get_sponsorblock_segments(vid_id)
+            return fallback_segments, fallback_ignore_ttl, True
+        # External results are not "locked" like SponsorBlock — let TTL apply.
+        return segments, False, False
+
+    async def _external_fallback(self, vid_id):
+        if self.external_fallback_to_sponsorblock:
+            segments, ignore_ttl = await self.get_sponsorblock_segments(vid_id)
+            return segments, ignore_ttl, True
+        return [], False, False
+
+    def _normalize_external_segments(self, raw_segments, source="external"):
+        candidates = []
+        for raw in raw_segments:
+            if not isinstance(raw, dict):
+                continue
+            action = raw.get("action", "skip")
+            if action != "skip":
+                continue
+            try:
+                start = float(raw["start"])
+                end = float(raw["end"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not (end > start):
+                continue
+            if (end - start) <= self.minimum_skip_length:
+                continue
+            confidence = raw.get("confidence")
+            try:
+                confidence_value = float(confidence) if confidence is not None else 1.0
+            except (TypeError, ValueError):
+                continue
+            if confidence_value < self.external_min_confidence:
+                continue
+            entry = {
+                "start": start,
+                "end": end,
+                "UUID": [],
+                "source": source,
+                "confidence": confidence_value,
+            }
+            category = raw.get("category")
+            if category:
+                entry["category"] = category
+            reason = raw.get("reason")
+            if reason:
+                entry["reason"] = reason
+            candidates.append(entry)
+
+        if not candidates:
+            return []
+
+        candidates.sort(key=lambda s: s["start"])
+        merged = [candidates[0]]
+        for seg in candidates[1:]:
+            last = merged[-1]
+            # Merge if overlapping or within 1 second of each other (matches SponsorBlock path).
+            if seg["start"] - last["end"] < 1:
+                last["end"] = max(last["end"], seg["end"])
+                last["confidence"] = min(last["confidence"], seg["confidence"])
+            else:
+                merged.append(seg)
+
+        return [s for s in merged if (s["end"] - s["start"]) > self.minimum_skip_length]
 
     @staticmethod
     def process_segments(response, minimum_skip_length):
@@ -264,6 +407,8 @@ class ApiHelper:
         Lets the contributor know that someone skipped the segment (thanks)"""
         if self.skip_count_tracking:
             for i in uuids:
+                if not i:
+                    continue
                 url = constants.SponsorBlock_api + "viewedVideoSponsorTime/"
                 params = {"UUID": i}
                 await self.web_session.post(url, params=params)

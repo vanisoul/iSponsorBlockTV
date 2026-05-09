@@ -58,6 +58,49 @@ during setup.
 The device can also be manually added to iSponsorBlockTV with a YouTube TV code.
 This code can be found in the settings page of your YouTube TV application.
 
+## External segment provider
+
+By default segments come from SponsorBlock. You can instead point
+iSponsorBlockTV at your own HTTP service (for example a local LLM-based
+classifier) by setting the following keys in `config.json`:
+
+```json
+"segment_provider": "external",
+"external_segment_url": "http://localhost:8787/segments",
+"external_segment_timeout_seconds": 20,
+"external_min_confidence": 0.85,
+"external_fallback_to_sponsorblock": true
+```
+
+When `segment_provider` is `"external"`, the app issues
+`GET <external_segment_url>?video_id=<id>` and expects a JSON response of the
+form:
+
+```json
+{
+  "status": "ok",
+  "video_id": "<id>",
+  "source": "my-provider",
+  "segments": [
+    {
+      "start": 12.5,
+      "end": 31.0,
+      "action": "skip",
+      "category": "sponsor",
+      "confidence": 0.92,
+      "reason": "optional human-readable note"
+    }
+  ]
+}
+```
+
+Only `start`, `end`, and (when present) a numeric `confidence` are required;
+`action` defaults to `"skip"`. Segments below `external_min_confidence`,
+shorter than `minimum_skip_length`, or with non-`skip` actions are dropped.
+If the request fails or returns no usable segments and
+`external_fallback_to_sponsorblock` is `true`, the app falls back to
+SponsorBlock for that video.
+
 ## Libraries used
 
 - [pyytlounge](https://github.com/FabioGNR/pyytlounge) Used to interact with the

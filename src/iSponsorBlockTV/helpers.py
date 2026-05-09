@@ -54,6 +54,11 @@ class Config:
         self.auto_play = True
         self.join_name = "iSponsorBlockTV"
         self.use_proxy = False
+        self.segment_provider = "sponsorblock"
+        self.external_segment_url = "http://localhost:8787/segments"
+        self.external_segment_timeout_seconds = 20
+        self.external_min_confidence = 0.85
+        self.external_fallback_to_sponsorblock = True
         self.__load()
 
     def validate(self):
