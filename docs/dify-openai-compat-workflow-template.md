@@ -1,61 +1,43 @@
 <!-- markdownlint-disable MD013 -->
 
-# Dify / Gateway mode
+# Dify mode
 
-This document describes the Dify-based mode.
+This document describes how to connect `iSponsorBlockTV` to Dify.
 
-The important boundary is simple:
+There are two valid ways to do it:
+
+1. **Dify direct**: `iSponsorBlockTV` calls the Dify Workflow API directly.
+2. **Dify as OpenAI-compatible**: Dify or a thin adapter exposes `/v1/chat/completions`.
+
+If Dify can already expose an OpenAI-compatible endpoint for the workflow, use that. Do not add another gateway just for abstraction.
+
+---
+
+## 1) Recommended simple mode: Dify direct
+
+Use this mode when the deployment target is Dify and the workflow API is acceptable as the public contract.
 
 ```text
 iSponsorBlockTV
-  -> OpenAI-compatible gateway: POST /v1/chat/completions
-    -> Dify workflow API
-      -> any model or tool chain, for example Gemini with a YouTube URL
-    -> normalized segment JSON
+  -> Dify Workflow API: POST /v1/workflows/run
+    -> Gemini / other internal workflow nodes
+    -> result_json
   -> iSponsorBlockTV validates and caches the segments
 ```
 
-`iSponsorBlockTV` does not need to know how the workflow works internally. It only talks to an OpenAI-compatible endpoint.
+In this mode, Dify is the stable I/O boundary.
+
+`iSponsorBlockTV` sends a YouTube video ID and URL to Dify. Dify can then use Gemini, tools, code nodes, or any other workflow steps to decide the skip ranges.
 
 ---
 
-## 1) Public endpoint seen by iSponsorBlockTV
-
-Expose a gateway URL such as:
-
-```text
-https://skip-ai.example.com/v1/chat/completions
-```
-
-Then configure `iSponsorBlockTV` with the base URL only:
-
-```json
-{
-  "segment_provider": "sponsorblock_then_ai",
-  "ai_base_url": "https://skip-ai.example.com",
-  "ai_api_key": "replace-with-gateway-token-if-needed",
-  "ai_model": "dify-skip-workflow",
-  "ai_timeout_seconds": 25,
-  "ai_cache_dir": "ai_segment_cache",
-  "ai_min_confidence": 0.85
-}
-```
-
-The client appends `/v1/chat/completions` by itself.
-
-So do **not** set `ai_base_url` to the full Dify workflow URL. Set it to the gateway base URL.
-
----
-
-## 2) Gateway to Dify workflow API
-
-The gateway receives an OpenAI chat/completions request from `iSponsorBlockTV`, extracts the video context, and calls Dify.
+## 2) Dify direct request shape
 
 Typical Dify workflow API shape:
 
 ```http
 POST https://api.dify.ai/v1/workflows/run
-Authorization: Bearer <DIFY_API_KEY>
+Authorization: Bearer ***
 Content-Type: application/json
 ```
 
@@ -74,13 +56,13 @@ Example request body:
 }
 ```
 
-If the gateway uses Dify streaming mode instead, it should read the stream until the workflow is finished, then take the final output field and convert it into the same OpenAI-compatible response.
+If streaming mode is used, the client must read the stream until the workflow is finished and then take the final output.
 
 ---
 
 ## 3) Dify workflow I/O
 
-Keep the Dify workflow I/O fixed. The workflow can do anything internally, but the gateway should depend on a small stable contract.
+Keep the Dify workflow I/O fixed. The workflow can do anything internally, but the caller should depend on a small stable contract.
 
 ### Inputs
 
@@ -101,7 +83,7 @@ Example `result_json` content:
 {
   "schema_version": "1.0",
   "video_id": "abc123",
-  "source": "dify_gateway",
+  "source": "dify",
   "status": "ok",
   "duration": 1420.5,
   "segments": [
@@ -118,7 +100,7 @@ Example `result_json` content:
 }
 ```
 
-`iSponsorBlockTV` only needs this final normalized result. It does not care whether the model produced natural language, JSON, tool output, or multiple intermediate answers inside Dify.
+`iSponsorBlockTV` only needs this final normalized result. It does not care whether the workflow used natural language, JSON, tool output, or multiple intermediate answers inside Dify.
 
 ---
 
@@ -163,13 +145,41 @@ The first 72 seconds look like an opening sequence. The section after 22:40 appe
 
 Then the normalize node converts that into `result_json`.
 
-The key point: **external AI does not have to be the stable API contract. Dify/Gateway is the stable API contract.**
+The key point: external AI does not have to be the stable API contract. Dify is the stable API contract.
 
 ---
 
-## 5) Gateway response back to iSponsorBlockTV
+## 5) Alternative: Dify as OpenAI-compatible
 
-The gateway must wrap the final `result_json` in an OpenAI-compatible chat/completions response:
+Use this mode only if Dify, or something in front of Dify, already accepts OpenAI chat/completions requests:
+
+```text
+POST /v1/chat/completions
+```
+
+In that case, configure `iSponsorBlockTV` with the OpenAI-compatible base URL:
+
+```json
+{
+  "segment_provider": "sponsorblock_then_ai",
+  "ai_base_url": "https://skip-ai.example.com",
+  "ai_api_key": "replace-with-token-if-needed",
+  "ai_model": "dify-skip-workflow",
+  "ai_timeout_seconds": 25,
+  "ai_cache_dir": "ai_segment_cache",
+  "ai_min_confidence": 0.85
+}
+```
+
+The client appends `/v1/chat/completions` by itself.
+
+This mode is useful only when the OpenAI-compatible endpoint already exists. If it does not exist, Dify direct is simpler than adding a new service just to translate formats.
+
+---
+
+## 6) OpenAI-compatible response shape
+
+If using the OpenAI-compatible path, the final `result_json` must be wrapped in a chat/completions response:
 
 ```json
 {
@@ -180,7 +190,7 @@ The gateway must wrap the final `result_json` in an OpenAI-compatible chat/compl
       "index": 0,
       "message": {
         "role": "assistant",
-        "content": "{\"schema_version\":\"1.0\",\"video_id\":\"abc123\",\"source\":\"dify_gateway\",\"status\":\"ok\",\"segments\":[] ,\"warnings\":[]}"
+        "content": "{\"schema_version\":\"1.0\",\"video_id\":\"abc123\",\"source\":\"dify\",\"status\":\"ok\",\"segments\":[],\"warnings\":[]}"
       },
       "finish_reason": "stop"
     }
@@ -192,7 +202,7 @@ The `content` value is a JSON string. `iSponsorBlockTV` parses and validates tha
 
 ---
 
-## 6) Failure behavior
+## 7) Failure behavior
 
 If Dify, Gemini, transcript lookup, or any internal step fails, return a valid no-op result:
 
@@ -200,7 +210,7 @@ If Dify, Gemini, transcript lookup, or any internal step fails, return a valid n
 {
   "schema_version": "1.0",
   "video_id": "abc123",
-  "source": "dify_gateway",
+  "source": "dify",
   "status": "fallback",
   "segments": [],
   "warnings": ["dify_failed"]
@@ -211,36 +221,6 @@ Playback should never be blocked by AI errors.
 
 ---
 
-## 7) What to configure in iSponsorBlockTV
-
-For a mounted config file under the app data directory, add these keys:
-
-```json
-{
-  "segment_provider": "sponsorblock_then_ai",
-  "ai_base_url": "https://skip-ai.example.com",
-  "ai_api_key": "replace-with-gateway-token-if-needed",
-  "ai_model": "dify-skip-workflow",
-  "ai_timeout_seconds": 25,
-  "ai_cache_dir": "ai_segment_cache",
-  "ai_min_confidence": 0.85
-}
-```
-
-Docker example:
-
-```yaml
-services:
-  iSponsorBlockTV:
-    image: ghcr.io/dmunozv04/isponsorblocktv
-    volumes:
-      - /path/to/data:/app/data
-```
-
-The config file should live inside the mounted data directory used by the container.
-
----
-
 ## 8) One-line summary
 
-`iSponsorBlockTV` calls one OpenAI-compatible URL. The gateway calls Dify. Dify can call Gemini with the YouTube URL. Only the final gateway response must be normalized into segment JSON.
+If Dify is the chosen backend, call Dify directly. Only use an OpenAI-compatible layer when that endpoint already exists or when provider portability is more important than simplicity.
