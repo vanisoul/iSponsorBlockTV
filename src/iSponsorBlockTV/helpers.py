@@ -57,9 +57,14 @@ class Config:
         # segment_provider modes:
         # - sponsorblock: only SponsorBlock
         # - external: GET external_segment_url?video_id=... -> {segments:[...]}
-        # - sponsorblock_then_ai: SponsorBlock first; if no segments, ask AI (OpenAI-compatible)
+        # - sponsorblock_then_ai: SponsorBlock first; if no segments, ask AI
         # - ai_only: always ask AI (use with caution)
         self.segment_provider = "sponsorblock"
+
+        # ai_provider modes:
+        # - openai_compatible: POST ai_base_url/v1/chat/completions
+        # - dify_workflow: POST dify_base_url/v1/workflows/run
+        self.ai_provider = "openai_compatible"
 
         # External HTTP provider (legacy / sidecar mode)
         self.external_segment_url = "http://localhost:8787/segments"
@@ -74,6 +79,12 @@ class Config:
         self.ai_timeout_seconds = 25
         self.ai_cache_dir = "ai_segment_cache"
         self.ai_min_confidence = 0.85
+
+        # Dify workflow AI provider
+        self.dify_base_url = ""
+        self.dify_api_key = ""
+        self.dify_response_mode = "blocking"
+        self.dify_user = "isponsorblocktv"
         self.__load()
 
     def validate(self):

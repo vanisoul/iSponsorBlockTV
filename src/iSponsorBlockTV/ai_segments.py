@@ -160,6 +160,30 @@ class AiConfig:
     min_confidence: float = 0.85
 
 
+@dataclass
+class DifyConfig:
+    base_url: str
+    api_key: str | None
+    timeout_seconds: int = 25
+    min_confidence: float = 0.85
+    response_mode: str = "blocking"
+    user: str = "isponsorblocktv"
+
+
+ALLOWED_AI_CATEGORIES = ["opening", "ending", "preview", "recap"]
+
+
+def _fallback_response(video_id: str, source: str, warning: str) -> dict[str, Any]:
+    return {
+        "schema_version": "1.0",
+        "video_id": video_id,
+        "source": source,
+        "status": "fallback",
+        "segments": [],
+        "warnings": [warning],
+    }
+
+
 def _cache_path(cache_dir: Path, video_id: str) -> Path:
     safe_id = "".join(ch for ch in str(video_id) if ch.isalnum() or ch in "_-")
     if not safe_id:
@@ -188,7 +212,9 @@ def save_cached_response(cache_dir: Path, video_id: str, response: dict[str, Any
     return path
 
 
-def _validate_segments(video_id: str, response: dict[str, Any], *, min_confidence: float) -> dict[str, Any]:
+def _validate_segments(
+    video_id: str, response: dict[str, Any], *, min_confidence: float
+) -> dict[str, Any]:
     """Validate + normalize a response into the minimal schema ApiHelper expects."""
 
     duration = response.get("duration")
@@ -260,7 +286,7 @@ def _validate_segments(video_id: str, response: dict[str, Any], *, min_confidenc
 
 
 def _build_prompt(video_id: str, context: dict[str, Any], *, min_confidence: float) -> str:
-    categories = ["opening", "ending", "preview", "recap"]
+    categories = ALLOWED_AI_CATEGORIES
     duration = context.get("duration")
     return (
         "You are a conservative YouTube skip-segment detector.\n\n"
@@ -310,7 +336,10 @@ async def infer_segments_openai_compatible(
         "temperature": 0.2,
         "messages": [
             {"role": "system", "content": "You output strict JSON only."},
-            {"role": "user", "content": _build_prompt(video_id, context, min_confidence=cfg.min_confidence)},
+            {
+                "role": "user",
+                "content": _build_prompt(video_id, context, min_confidence=cfg.min_confidence),
+            },
         ],
     }
 
@@ -347,38 +376,95 @@ async def infer_segments_openai_compatible(
         content = None
 
     if not content or not str(content).strip():
-        return {
-            "schema_version": "1.0",
-            "video_id": video_id,
-            "source": "openai_compat",
-            "status": "fallback",
-            "segments": [],
-            "warnings": ["ai_empty_content"],
-        }
-
+        return _fallback_response(video_id, "openai_compat", "ai_empty_content")
     try:
         parsed = json.loads(content)
     except Exception:
-        return {
-            "schema_version": "1.0",
-            "video_id": video_id,
-            "source": "openai_compat",
-            "status": "fallback",
-            "segments": [],
-            "warnings": ["ai_non_json_content"],
-        }
+        return _fallback_response(video_id, "openai_compat", "ai_non_json_content")
 
     if not isinstance(parsed, dict):
-        return {
-            "schema_version": "1.0",
-            "video_id": video_id,
-            "source": "openai_compat",
-            "status": "fallback",
-            "segments": [],
-            "warnings": ["ai_json_not_object"],
-        }
+        return _fallback_response(video_id, "openai_compat", "ai_json_not_object")
 
     # Ensure video_id is set
     parsed.setdefault("video_id", video_id)
     parsed.setdefault("source", "openai_compat")
+    return _validate_segments(video_id, parsed, min_confidence=cfg.min_confidence)
+
+
+def _extract_dify_result_json(raw: dict[str, Any]) -> Any:
+    """Extract the normalized result from common Dify workflow response shapes."""
+
+    outputs = raw.get("outputs")
+    if not isinstance(outputs, dict):
+        data = raw.get("data")
+        if isinstance(data, dict):
+            outputs = data.get("outputs")
+    if not isinstance(outputs, dict):
+        return None
+
+    for key in ("result_json", "result", "answer", "text"):
+        if key in outputs:
+            return outputs[key]
+    return None
+
+
+async def infer_segments_dify_workflow(
+    session: ClientSession,
+    video_id: str,
+    *,
+    cfg: DifyConfig,
+) -> dict[str, Any]:
+    """Call Dify Workflow API directly and return validated segment JSON."""
+
+    logger = logging.getLogger(__name__)
+    url = cfg.base_url.rstrip("/") + "/v1/workflows/run"
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if cfg.api_key:
+        headers["Authorization"] = f"Bearer {cfg.api_key}"
+
+    payload = {
+        "inputs": {
+            "video_id": video_id,
+            "youtube_url": f"https://www.youtube.com/watch?v={video_id}",
+            "min_confidence": cfg.min_confidence,
+            "allowed_categories": ALLOWED_AI_CATEGORIES,
+        },
+        "response_mode": cfg.response_mode,
+        "user": cfg.user,
+    }
+
+    timeout = ClientTimeout(total=cfg.timeout_seconds)
+    try:
+        async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                logger.warning(
+                    "Dify endpoint HTTP %s for %s: %s", resp.status, video_id, text[:400]
+                )
+                return _fallback_response(video_id, "dify", f"dify_http_{resp.status}")
+            raw = json.loads(text)
+    except Exception as exc:
+        logger.warning("Dify endpoint request failed for %s: %s", video_id, exc)
+        return _fallback_response(video_id, "dify", f"dify_request_failed:{type(exc).__name__}")
+
+    if not isinstance(raw, dict):
+        return _fallback_response(video_id, "dify", "dify_json_not_object")
+
+    result_json = _extract_dify_result_json(raw)
+    if result_json in (None, ""):
+        return _fallback_response(video_id, "dify", "dify_empty_result_json")
+
+    if isinstance(result_json, dict):
+        parsed = result_json
+    else:
+        try:
+            parsed = json.loads(str(result_json))
+        except Exception:
+            return _fallback_response(video_id, "dify", "dify_non_json_result")
+
+    if not isinstance(parsed, dict):
+        return _fallback_response(video_id, "dify", "dify_result_not_object")
+
+    parsed.setdefault("video_id", video_id)
+    parsed.setdefault("source", "dify")
     return _validate_segments(video_id, parsed, min_confidence=cfg.min_confidence)

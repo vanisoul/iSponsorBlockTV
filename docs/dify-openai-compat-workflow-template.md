@@ -1,110 +1,183 @@
-# Dify：用「OpenAI 相容 API」做 iSponsorBlockTV AI 跳過判決（模板）
+<!-- markdownlint-disable MD013 -->
 
-這份文件是給東政留存用：目標是讓 Dify 背後可以接任何 LLM（Gemini / OpenAI / 其他），
-但對 iSponsorBlockTV 來說只需要一個 *OpenAI-compatible* 的 base URL。
+# Dify workflow provider
 
-> iSponsorBlockTV 會呼叫：`{ai_base_url}/v1/chat/completions`
+This document describes how to connect `iSponsorBlockTV` directly to the Dify Workflow API.
 
----
+The simple path is:
 
-## 1) iSponsorBlockTV 端期待的輸出（嚴格 JSON）
+```text
+iSponsorBlockTV
+  -> Dify Workflow API: POST /v1/workflows/run
+    -> Gemini or other workflow nodes
+    -> result_json
+  -> iSponsorBlockTV validates and caches the segments
+```
 
-模型/工作流最後要輸出「只包含 JSON」的字串（不要 markdown），格式建議：
+Dify is the stable I/O boundary. The external model does not need to be the API contract.
+
+## 1) iSponsorBlockTV configuration
+
+```json
+{
+  "segment_provider": "sponsorblock_then_ai",
+  "ai_provider": "dify_workflow",
+  "dify_base_url": "https://api.dify.ai",
+  "dify_api_key": "replace-with-dify-workflow-api-key",
+  "dify_response_mode": "blocking",
+  "dify_user": "isponsorblocktv",
+  "ai_timeout_seconds": 25,
+  "ai_cache_dir": "ai_segment_cache",
+  "ai_min_confidence": 0.85
+}
+```
+
+`dify_base_url` is the Dify API base URL only. The app appends `/v1/workflows/run`.
+
+## 2) Request sent to Dify
+
+```http
+POST https://api.dify.ai/v1/workflows/run
+Authorization: Bearer <DIFY_API_KEY>
+Content-Type: application/json
+Accept: application/json
+```
+
+Example body:
+
+```json
+{
+  "inputs": {
+    "video_id": "abc123",
+    "youtube_url": "https://www.youtube.com/watch?v=abc123",
+    "min_confidence": 0.85,
+    "allowed_categories": ["opening", "ending", "preview", "recap"]
+  },
+  "response_mode": "blocking",
+  "user": "isponsorblocktv"
+}
+```
+
+## 3) Dify workflow I/O
+
+Keep the Dify workflow I/O fixed. The workflow can do anything internally, but the caller depends on a small stable contract.
+
+### Inputs
+
+- `video_id`: YouTube video ID
+- `youtube_url`: full YouTube URL
+- `min_confidence`: minimum confidence for auto-skip
+- `allowed_categories`: categories that may be skipped
+
+### Output
+
+Recommended final output variable:
+
+- `result_json`: a string containing the final segment JSON
+
+Example `result_json` content:
 
 ```json
 {
   "schema_version": "1.0",
   "video_id": "abc123",
-  "source": "dify_openai_compat",
+  "source": "dify",
   "status": "ok",
   "duration": 1420.5,
   "segments": [
     {
-      "start": 30.0,
-      "end": 60.0,
+      "start": 0.0,
+      "end": 72.0,
       "category": "opening",
       "action": "skip",
-      "confidence": 0.91,
-      "reason": "opening recap before main content"
+      "confidence": 0.9,
+      "reason": "opening section before the main content"
     }
   ],
   "warnings": []
 }
 ```
 
-保守規則（務必做到）：
-- 不確定就回 `segments: []`
-- 不要負數時間
-- `end > start`
-- 不要 overlap
-- 不能超過 duration（若 duration 不明就更保守）
+`iSponsorBlockTV` only needs this final normalized result. It does not care whether the workflow used natural language, JSON, tool output, or multiple intermediate answers inside Dify.
 
----
+## 4) Example workflow: Gemini with a YouTube URL
 
-## 2) 在 Dify 建工作流：建議輸入/輸出欄位
+A simple Dify workflow can look like this:
 
-### Inputs（建議）
-讓你未來可以從不同上游（或你手動測試）丟資料：
+```text
+Start
+  -> LLM node: Gemini
+      input: youtube_url, allowed_categories, min_confidence
+      task: inspect the YouTube video and suggest skip ranges
+      output: natural-language analysis or structured draft
+  -> LLM or code node: normalize
+      input: Gemini analysis
+      task: convert candidate ranges into result_json
+  -> End
+      output: result_json
+```
 
-- `video_id` (string)
-- `context_json` (string)  ← 這裡放「影片資訊（title/chapters/transcript...）」的 JSON 字串
-- `duration` (number, optional)
-- `min_confidence` (number, default 0.85)
-- `categories_json` (string, optional) 例如 `["opening","ending","preview","recap"]`
+Example Gemini prompt:
 
-> 你要從哪裡抓 context 都可以：
-> - 由 iSponsorBlockTV 端抓（未來若裝 yt-dlp / transcript）
-> - 或由你在 Dify 外面做一層 gateway/collector 先整理好再送進工作流
+```text
+You are analyzing a YouTube video for automatic skip ranges.
 
-### Outputs（建議）
-請讓 workflow 最終輸出以下其中一種（擇一即可）：
-- `result_json`：*字串*，內容就是上面那個嚴格 JSON（最推薦）
-- 或 `result`：*物件*（Dify 若能直接輸出 object）
+Video URL:
+{{ youtube_url }}
 
----
+Find only these skippable categories:
+{{ allowed_categories }}
 
-## 3) 兩種部署形態（你提到的「要能串接其他 API」）
+Return candidate ranges for opening, ending, preview, recap, or end screen.
+Do not skip main content. If uncertain, say that no safe segment is available.
+Include start time, end time, category, confidence, and a short reason.
+```
 
-### 方案 A（最簡單、最常用）：Dify 工作流 + 小轉接服務
-- iSponsorBlockTV → 打你的小 proxy（OpenAI 相容）
-- proxy → 呼叫 Dify workflow run
-- proxy → 把輸出包成 OpenAI chat/completions 回應
+The Gemini node may answer naturally, for example:
 
-優點：
-- Dify 不用硬改成 OpenAI 介面
-- 你可以在 proxy 內做快取、熔斷、重試、fallback
+```text
+The first 72 seconds look like an opening sequence.
+The section after 22:40 appears to be an ending and next-video preview.
+```
 
-### 方案 B：你有 API Gateway 能直接回 OpenAI 相容
-- iSponsorBlockTV → 直接打 gateway 的 `/v1/chat/completions`
-- gateway 內部再去跑 Dify workflow / 其他 API
+Then the normalize node converts that into `result_json`.
 
-優點：
-- iSponsorBlockTV 端最乾淨
+## 5) Failure behavior
 
----
+If Dify, Gemini, transcript lookup, or any internal step fails, return a valid no-op result:
 
-## 4) 你要「第二次要擋」的建議（兩段式保守防呆）
+```json
+{
+  "schema_version": "1.0",
+  "video_id": "abc123",
+  "source": "dify",
+  "status": "fallback",
+  "segments": [],
+  "warnings": ["dify_failed"]
+}
+```
 
-如果你擔心 LLM 太激進，可以做兩段式：
+Playback should never be blocked by AI errors.
 
-1) **第一次：產生候選 segments**（寧可多、但要在合理範圍內）
-2) **第二次：審核/縮減 segments**（更保守，確保不會跳到主內容）
+## 6) OpenAI-compatible adapter mode
 
-第二段審核可以用更嚴的規則：
-- 只允許落在 0~120 秒（opening/recap）或最後 120 秒（ending）等硬範圍
-- 或要求章節標題包含 opening/ending/recap 類關鍵字才可過
+Use an OpenAI-compatible adapter only when the caller must keep the OpenAI chat/completions request shape.
 
-最後只輸出審核通過的 segments。
+The official Dify app API uses Dify-native endpoints such as:
 
----
+- `/v1/workflows/run`
+- `/v1/chat-messages`
+- `/v1/completion-messages`
 
-## 5) 與 iSponsorBlockTV 的設定對應（提醒）
+It is not the same request shape as OpenAI `/v1/chat/completions`.
 
-iSponsorBlockTV 的 config.json 你會設：
-- `segment_provider`: `"sponsorblock_then_ai"`
-- `ai_base_url`: `"https://<你的 openai-compat 入口>"`
-- `ai_api_key`: `"<token 或空字串>"`
-- `ai_model`: `"<你在 gateway/dify 端對應的 model 名稱>"`
+If an adapter is used, it translates:
 
-> 注意：iSponsorBlockTV 不會直接懂 Dify workflow 的 `/v1/workflows/run`，
-> 所以你要嘛做「方案 A 的 proxy」，要嘛做「方案 B 的 gateway」。
+```text
+OpenAI chat/completions request
+  -> Dify /v1/workflows/run request
+  -> Dify result_json
+  -> OpenAI chat/completions response
+```
+
+For this project, direct Dify workflow mode is simpler when Dify is the chosen backend.
