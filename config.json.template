@@ -23,8 +23,16 @@
     ],
     "use_proxy": false,
     "segment_provider": "sponsorblock",
+
     "external_segment_url": "http://localhost:8787/segments",
     "external_segment_timeout_seconds": 20,
     "external_min_confidence": 0.85,
-    "external_fallback_to_sponsorblock": true
+    "external_fallback_to_sponsorblock": true,
+
+    "ai_base_url": "",
+    "ai_api_key": "",
+    "ai_model": "",
+    "ai_timeout_seconds": 25,
+    "ai_cache_dir": "ai_segment_cache",
+    "ai_min_confidence": 0.85
 }

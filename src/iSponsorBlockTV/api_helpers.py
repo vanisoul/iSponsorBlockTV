@@ -6,6 +6,10 @@ from typing import AsyncIterator, Collection, TypeVar
 
 from aiohttp import ClientSession, ClientTimeout
 from cache import AsyncLRU
+
+from pathlib import Path
+
+from .ai_segments import AiConfig, build_video_context, infer_segments_openai_compatible, load_cached_response, save_cached_response
 from pyytlounge.wrapper import api_base
 
 from . import chromecast_client, constants, dial_client
@@ -62,17 +66,27 @@ class ApiHelper:
         self.web_session = web_session
         self.num_devices = len(config.devices)
         self.minimum_skip_length = config.minimum_skip_length
+        self.data_dir = getattr(config, "data_dir", None)
+
         self.segment_provider = getattr(config, "segment_provider", "sponsorblock")
-        self.external_segment_url = getattr(
-            config, "external_segment_url", "http://localhost:8787/segments"
-        )
-        self.external_segment_timeout_seconds = getattr(
-            config, "external_segment_timeout_seconds", 20
-        )
+
+        # External HTTP provider (sidecar)
+        self.external_segment_url = getattr(config, "external_segment_url", "http://localhost:8787/segments")
+        self.external_segment_timeout_seconds = getattr(config, "external_segment_timeout_seconds", 20)
         self.external_min_confidence = getattr(config, "external_min_confidence", 0.85)
-        self.external_fallback_to_sponsorblock = getattr(
-            config, "external_fallback_to_sponsorblock", True
-        )
+        self.external_fallback_to_sponsorblock = getattr(config, "external_fallback_to_sponsorblock", True)
+
+        # AI fallback (in-process)
+        self.ai_base_url = getattr(config, "ai_base_url", "")
+        self.ai_api_key = getattr(config, "ai_api_key", "")
+        self.ai_model = getattr(config, "ai_model", "")
+        self.ai_timeout_seconds = int(getattr(config, "ai_timeout_seconds", 25) or 25)
+        self.ai_cache_dir_name = getattr(config, "ai_cache_dir", "ai_segment_cache")
+        self.ai_min_confidence = float(getattr(config, "ai_min_confidence", 0.85) or 0.85)
+
+        # resolve cache dir under data_dir when available
+        base_cache_dir = Path(self.data_dir) if self.data_dir else Path(".")
+        self.ai_cache_dir = base_cache_dir / self.ai_cache_dir_name
 
     @staticmethod
     def _normalize_pairing_code(pairing_code):
@@ -198,6 +212,18 @@ class ApiHelper:
         if self.segment_provider == "external":
             segments, ignore_ttl, _used_fallback = await self.get_external_segments(vid_id)
             return segments, ignore_ttl
+
+        if self.segment_provider == "ai_only":
+            segments, ignore_ttl = await self.get_ai_segments(vid_id)
+            return segments, ignore_ttl
+
+        if self.segment_provider == "sponsorblock_then_ai":
+            sponsor_segments, sponsor_ignore_ttl = await self.get_sponsorblock_segments(vid_id)
+            if sponsor_segments:
+                return sponsor_segments, sponsor_ignore_ttl
+            ai_segments, ai_ignore_ttl = await self.get_ai_segments(vid_id)
+            return ai_segments, ai_ignore_ttl
+
         return await self.get_sponsorblock_segments(vid_id)
 
     async def get_sponsorblock_segments(self, vid_id):
@@ -225,6 +251,50 @@ class ApiHelper:
                 response_json = i
                 break
         return self.process_segments(response_json, self.minimum_skip_length)
+
+    async def get_ai_segments(self, vid_id):
+        """Infer segments via OpenAI-compatible API, with a local JSON cache.
+
+        Returns (segments, ignore_ttl). AI results are treated as non-locked and may be cached
+        by the AsyncConditionalTTL wrapper (ignore_ttl=False).
+        """
+
+        logger = logging.getLogger(__name__)
+
+        if not self.ai_base_url or not self.ai_model:
+            return [], False
+
+        # 1) local cache
+        cached = load_cached_response(self.ai_cache_dir, vid_id)
+        if isinstance(cached, dict) and cached.get("video_id") == vid_id:
+            segments = self._normalize_external_segments(cached.get("segments") or [], cached.get("source", "ai"))
+            if segments:
+                return segments, False
+
+        # 2) build context best-effort
+        context = build_video_context(vid_id)
+
+        # 3) call AI
+        cfg = AiConfig(
+            base_url=str(self.ai_base_url),
+            api_key=str(self.ai_api_key) if self.ai_api_key else None,
+            model=str(self.ai_model),
+            timeout_seconds=int(self.ai_timeout_seconds),
+            min_confidence=float(self.ai_min_confidence),
+        )
+
+        result = await infer_segments_openai_compatible(self.web_session, vid_id, cfg=cfg, context=context)
+        if not isinstance(result, dict) or result.get("video_id") != vid_id:
+            return [], False
+
+        # persist raw result for future use
+        try:
+            save_cached_response(self.ai_cache_dir, vid_id, result)
+        except Exception as exc:
+            logger.debug("Failed saving AI cache for %s: %s", vid_id, exc)
+
+        segments = self._normalize_external_segments(result.get("segments") or [], result.get("source", "ai"))
+        return segments, False
 
     async def get_external_segments(self, vid_id):
         """Fetch segments from the external provider.

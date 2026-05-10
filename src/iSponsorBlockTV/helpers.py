@@ -54,11 +54,26 @@ class Config:
         self.auto_play = True
         self.join_name = "iSponsorBlockTV"
         self.use_proxy = False
+        # segment_provider modes:
+        # - sponsorblock: only SponsorBlock
+        # - external: GET external_segment_url?video_id=... -> {segments:[...]}
+        # - sponsorblock_then_ai: SponsorBlock first; if no segments, ask AI (OpenAI-compatible)
+        # - ai_only: always ask AI (use with caution)
         self.segment_provider = "sponsorblock"
+
+        # External HTTP provider (legacy / sidecar mode)
         self.external_segment_url = "http://localhost:8787/segments"
         self.external_segment_timeout_seconds = 20
         self.external_min_confidence = 0.85
         self.external_fallback_to_sponsorblock = True
+
+        # AI fallback (in-process; no watcher sidecar)
+        self.ai_base_url = ""
+        self.ai_api_key = ""
+        self.ai_model = ""
+        self.ai_timeout_seconds = 25
+        self.ai_cache_dir = "ai_segment_cache"
+        self.ai_min_confidence = 0.85
         self.__load()
 
     def validate(self):
