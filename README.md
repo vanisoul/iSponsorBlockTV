@@ -58,6 +58,81 @@ during setup.
 The device can also be manually added to iSponsorBlockTV with a YouTube TV code.
 This code can be found in the settings page of your YouTube TV application.
 
+## Segment providers (where skip segments come from)
+
+By default segments come from SponsorBlock.
+
+This project supports multiple segment sources, configured via `config.json`:
+
+- `"sponsorblock"` (default): only SponsorBlock.
+- `"external"`: call your own HTTP service via `GET <external_segment_url>?video_id=<id>`.
+- `"sponsorblock_then_ai"`: SponsorBlock first; if it returns no segments, ask an AI decision endpoint (OpenAI-compatible) and cache the result locally.
+- `"ai_only"`: always ask AI (use with caution).
+
+### External segment provider (HTTP GET)
+
+You can point iSponsorBlockTV at your own HTTP service by setting:
+
+```json
+"segment_provider": "external",
+"external_segment_url": "http://localhost:8787/segments",
+"external_segment_timeout_seconds": 20,
+"external_min_confidence": 0.85,
+"external_fallback_to_sponsorblock": true
+```
+
+When `segment_provider` is `"external"`, the app issues `GET <external_segment_url>?video_id=<id>` and expects a JSON response of the form:
+
+```json
+{
+  "status": "ok",
+  "video_id": "<id>",
+  "source": "my-provider",
+  "segments": [
+    {
+      "start": 12.5,
+      "end": 31.0,
+      "action": "skip",
+      "category": "sponsor",
+      "confidence": 0.92,
+      "reason": "optional human-readable note"
+    }
+  ]
+}
+```
+
+Only `start`, `end`, and (when present) a numeric `confidence` are required;
+`action` defaults to `"skip"`. Segments below `external_min_confidence`,
+shorter than `minimum_skip_length`, or with non-`skip` actions are dropped.
+If the request fails or returns no usable segments and `external_fallback_to_sponsorblock` is `true`, the app falls back to SponsorBlock for that video.
+
+### AI fallback (OpenAI-compatible)
+
+If you want AI-assisted skipping *without running a separate watcher/sidecar project*, use:
+
+- `"segment_provider": "sponsorblock_then_ai"` (recommended)
+
+The flow is:
+
+1. Try SponsorBlock.
+2. If SponsorBlock returns no segments, call an OpenAI-compatible endpoint at:
+   - `{ai_base_url}/v1/chat/completions`
+3. Save the validated response to a local JSON cache under the data dir, so the next play is DB/cache-first.
+
+Required `config.json` keys:
+
+```json
+"segment_provider": "sponsorblock_then_ai",
+"ai_base_url": "https://your-openai-compatible-base-url",
+"ai_api_key": "",
+"ai_model": "your-model-name",
+"ai_timeout_seconds": 25,
+"ai_cache_dir": "ai_segment_cache",
+"ai_min_confidence": 0.85
+```
+
+See: `docs/ai-segment-provider.md` and `docs/dify-openai-compat-workflow-template.md`.
+
 ## Libraries used
 
 - [pyytlounge](https://github.com/FabioGNR/pyytlounge) Used to interact with the
