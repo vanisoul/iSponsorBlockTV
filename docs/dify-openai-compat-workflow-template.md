@@ -7,9 +7,9 @@ This document describes how to connect `iSponsorBlockTV` to Dify.
 There are two valid ways to do it:
 
 1. **Dify direct**: `iSponsorBlockTV` calls the Dify Workflow API directly.
-2. **Dify as OpenAI-compatible**: Dify or a thin adapter exposes `/v1/chat/completions`.
+2. **Adapter mode**: a thin adapter exposes `/v1/chat/completions` in front of Dify.
 
-If Dify can already expose an OpenAI-compatible endpoint for the workflow, use that. Do not add another gateway just for abstraction.
+Dify's published application API uses Dify-native endpoints such as `/v1/workflows/run`, `/v1/chat-messages`, and `/v1/completion-messages`. It is not the same request shape as OpenAI chat/completions.
 
 ---
 
@@ -149,15 +149,24 @@ The key point: external AI does not have to be the stable API contract. Dify is 
 
 ---
 
-## 5) Alternative: Dify as OpenAI-compatible
+## 5) Alternative: adapter mode
 
-Use this mode only if Dify, or something in front of Dify, already accepts OpenAI chat/completions requests:
+Use this mode only if something in front of Dify accepts OpenAI chat/completions requests:
 
 ```text
 POST /v1/chat/completions
 ```
 
-In that case, configure `iSponsorBlockTV` with the OpenAI-compatible base URL:
+The official Dify app API does not publish this as the normal workflow input shape. If the caller must speak OpenAI chat/completions, the adapter translates:
+
+```text
+OpenAI chat/completions request
+  -> Dify /v1/workflows/run request
+  -> Dify result_json
+  -> OpenAI chat/completions response
+```
+
+Then configure `iSponsorBlockTV` with the adapter's OpenAI-compatible base URL:
 
 ```json
 {
@@ -173,7 +182,7 @@ In that case, configure `iSponsorBlockTV` with the OpenAI-compatible base URL:
 
 The client appends `/v1/chat/completions` by itself.
 
-This mode is useful only when the OpenAI-compatible endpoint already exists. If it does not exist, Dify direct is simpler than adding a new service just to translate formats.
+This mode is useful only when OpenAI-compatible input is required by the caller. If the app can call Dify directly, Dify direct is simpler than adding an adapter just to translate formats.
 
 ---
 
@@ -223,4 +232,4 @@ Playback should never be blocked by AI errors.
 
 ## 8) One-line summary
 
-If Dify is the chosen backend, call Dify directly. Only use an OpenAI-compatible layer when that endpoint already exists or when provider portability is more important than simplicity.
+If Dify is the chosen backend, call Dify directly. Only use an OpenAI-compatible adapter when the caller must keep the OpenAI chat/completions request shape.
