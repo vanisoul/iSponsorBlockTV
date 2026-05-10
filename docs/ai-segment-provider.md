@@ -1,3 +1,5 @@
+<!-- markdownlint-disable MD013 -->
+
 # AI segment provider (OpenAI-compatible)
 
 這個功能請直接理解成 **只有兩種模式**，不要再分太多層：
@@ -12,7 +14,9 @@
 - 都期待固定 JSON schema 的回應
 
 也就是說：
-**iSponsorBlockTV 不需要知道後面是真 OpenAI、Gemini 相容服務、還是 Dify workflow。**
+**iSponsorBlockTV 不需要知道後面是真 OpenAI、Gemini、還是 Dify workflow。**
+
+如果使用 Dify / Gateway 模式，外部 AI 不一定要直接輸出固定 JSON。外部 AI 可以回自然語言、工具結果或中間分析；只要 Dify / Gateway 最後整理成 `iSponsorBlockTV` 能驗證的 segments JSON 即可。
 
 ---
 
@@ -21,7 +25,9 @@
 建議模式：
 
 ```json
-"segment_provider": "sponsorblock_then_ai"
+{
+  "segment_provider": "sponsorblock_then_ai"
+}
 ```
 
 流程很單純：
@@ -39,13 +45,15 @@
 ## 2) iSponsorBlockTV 的設定
 
 ```json
-"segment_provider": "sponsorblock_then_ai",
-"ai_base_url": "https://your-openai-compatible-base-url",
-"ai_api_key": "",
-"ai_model": "your-model-name",
-"ai_timeout_seconds": 25,
-"ai_cache_dir": "ai_segment_cache",
-"ai_min_confidence": 0.85
+{
+  "segment_provider": "sponsorblock_then_ai",
+  "ai_base_url": "https://your-openai-compatible-base-url",
+  "ai_api_key": "",
+  "ai_model": "your-model-name",
+  "ai_timeout_seconds": 25,
+  "ai_cache_dir": "ai_segment_cache",
+  "ai_min_confidence": 0.85
+}
 ```
 
 ---
@@ -110,6 +118,7 @@ Request body 會是標準 OpenAI chat/completions 形式，大意像這樣：
 - 外部介面固定
 - 內部流程自由
 - iSponsorBlockTV 不需要知道 Dify 的 workflow API 細節
+- 外部 AI 可自然語言回答；由 Dify / Gateway 負責整理成最後的 segments JSON
 
 ---
 
