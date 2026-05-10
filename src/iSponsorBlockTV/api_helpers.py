@@ -9,7 +9,15 @@ from cache import AsyncLRU
 
 from pathlib import Path
 
-from .ai_segments import AiConfig, build_video_context, infer_segments_openai_compatible, load_cached_response, save_cached_response
+from .ai_segments import (
+    AiConfig,
+    DifyConfig,
+    build_video_context,
+    infer_segments_dify_workflow,
+    infer_segments_openai_compatible,
+    load_cached_response,
+    save_cached_response,
+)
 from pyytlounge.wrapper import api_base
 
 from . import chromecast_client, constants, dial_client
@@ -71,18 +79,31 @@ class ApiHelper:
         self.segment_provider = getattr(config, "segment_provider", "sponsorblock")
 
         # External HTTP provider (sidecar)
-        self.external_segment_url = getattr(config, "external_segment_url", "http://localhost:8787/segments")
-        self.external_segment_timeout_seconds = getattr(config, "external_segment_timeout_seconds", 20)
+        self.external_segment_url = getattr(
+            config, "external_segment_url", "http://localhost:8787/segments"
+        )
+        self.external_segment_timeout_seconds = getattr(
+            config, "external_segment_timeout_seconds", 20
+        )
         self.external_min_confidence = getattr(config, "external_min_confidence", 0.85)
-        self.external_fallback_to_sponsorblock = getattr(config, "external_fallback_to_sponsorblock", True)
+        self.external_fallback_to_sponsorblock = getattr(
+            config, "external_fallback_to_sponsorblock", True
+        )
 
         # AI fallback (in-process)
+        self.ai_provider = getattr(config, "ai_provider", "openai_compatible")
         self.ai_base_url = getattr(config, "ai_base_url", "")
         self.ai_api_key = getattr(config, "ai_api_key", "")
         self.ai_model = getattr(config, "ai_model", "")
         self.ai_timeout_seconds = int(getattr(config, "ai_timeout_seconds", 25) or 25)
         self.ai_cache_dir_name = getattr(config, "ai_cache_dir", "ai_segment_cache")
         self.ai_min_confidence = float(getattr(config, "ai_min_confidence", 0.85) or 0.85)
+
+        # Dify workflow provider
+        self.dify_base_url = getattr(config, "dify_base_url", "")
+        self.dify_api_key = getattr(config, "dify_api_key", "")
+        self.dify_response_mode = getattr(config, "dify_response_mode", "blocking")
+        self.dify_user = getattr(config, "dify_user", "isponsorblocktv")
 
         # resolve cache dir under data_dir when available
         base_cache_dir = Path(self.data_dir) if self.data_dir else Path(".")
@@ -261,29 +282,47 @@ class ApiHelper:
 
         logger = logging.getLogger(__name__)
 
-        if not self.ai_base_url or not self.ai_model:
+        if self.ai_provider == "dify_workflow":
+            if not self.dify_base_url:
+                return [], False
+        elif not self.ai_base_url or not self.ai_model:
             return [], False
 
         # 1) local cache
         cached = load_cached_response(self.ai_cache_dir, vid_id)
         if isinstance(cached, dict) and cached.get("video_id") == vid_id:
-            segments = self._normalize_external_segments(cached.get("segments") or [], cached.get("source", "ai"))
+            segments = self._normalize_external_segments(
+                cached.get("segments") or [], cached.get("source", "ai")
+            )
             if segments:
                 return segments, False
 
-        # 2) build context best-effort
-        context = build_video_context(vid_id)
-
-        # 3) call AI
-        cfg = AiConfig(
-            base_url=str(self.ai_base_url),
-            api_key=str(self.ai_api_key) if self.ai_api_key else None,
-            model=str(self.ai_model),
-            timeout_seconds=int(self.ai_timeout_seconds),
-            min_confidence=float(self.ai_min_confidence),
-        )
-
-        result = await infer_segments_openai_compatible(self.web_session, vid_id, cfg=cfg, context=context)
+        # 2) call AI provider
+        if self.ai_provider == "dify_workflow":
+            cfg = DifyConfig(
+                base_url=str(self.dify_base_url),
+                api_key=str(self.dify_api_key) if self.dify_api_key else None,
+                timeout_seconds=int(self.ai_timeout_seconds),
+                min_confidence=float(self.ai_min_confidence),
+                response_mode=str(self.dify_response_mode or "blocking"),
+                user=str(self.dify_user or "isponsorblocktv"),
+            )
+            result = await infer_segments_dify_workflow(self.web_session, vid_id, cfg=cfg)
+        else:
+            context = build_video_context(vid_id)
+            cfg = AiConfig(
+                base_url=str(self.ai_base_url),
+                api_key=str(self.ai_api_key) if self.ai_api_key else None,
+                model=str(self.ai_model),
+                timeout_seconds=int(self.ai_timeout_seconds),
+                min_confidence=float(self.ai_min_confidence),
+            )
+            result = await infer_segments_openai_compatible(
+                self.web_session,
+                vid_id,
+                cfg=cfg,
+                context=context,
+            )
         if not isinstance(result, dict) or result.get("video_id") != vid_id:
             return [], False
 
@@ -293,7 +332,9 @@ class ApiHelper:
         except Exception as exc:
             logger.debug("Failed saving AI cache for %s: %s", vid_id, exc)
 
-        segments = self._normalize_external_segments(result.get("segments") or [], result.get("source", "ai"))
+        segments = self._normalize_external_segments(
+            result.get("segments") or [], result.get("source", "ai")
+        )
         return segments, False
 
     async def get_external_segments(self, vid_id):
